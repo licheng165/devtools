@@ -1,0 +1,277 @@
+diff --git a/falcon/connection_pool/falcon_worker_task.cpp b/falcon/connection_pool/falcon_worker_task.cpp
+index 7f27bfc..0407e27 100644
+--- a/falcon/connection_pool/falcon_worker_task.cpp
++++ b/falcon/connection_pool/falcon_worker_task.cpp
+@@ -129,6 +129,38 @@ private:
+     std::vector<PGresult *> &m_results;
+ };
+ 
++/*
++ * RAII guard: free()s every already-populated "data" pointer in a
++ * std::vector<std::pair<char*, uint32_t>> on scope exit. Used to protect the
++ * partial state when parsing the reply buffer can throw in the middle of the
++ * loop (e.g. "response is corrupt.").  Call dismiss() once all entries have
++ * been successfully handed off to ProcessResponse (ownership transfer).
++ */
++class ReplyPartsGuard {
++public:
++    explicit ReplyPartsGuard(std::vector<std::pair<char *, uint32_t>> &parts)
++        : m_parts(parts), m_dismissed(false) {}
++    ~ReplyPartsGuard()
++    {
++        if (m_dismissed)
++            return;
++        for (auto &entry : m_parts) {
++            if (entry.first != nullptr) {
++                free(entry.first);
++                entry.first = nullptr;
++            }
++        }
++    }
++    void dismiss() { m_dismissed = true; }
++
++    ReplyPartsGuard(const ReplyPartsGuard &) = delete;
++    ReplyPartsGuard &operator=(const ReplyPartsGuard &) = delete;
++
++private:
++    std::vector<std::pair<char *, uint32_t>> &m_parts;
++    bool m_dismissed;
++};
++
+ void SingleWorkerTask::DoWork(PGconn *conn,
+                               flatbuffers::FlatBufferBuilder &flatBufferBuilder,
+                               SerializedData &replyBuilder)
+@@ -424,10 +456,25 @@ void BatchWorkerTask::DoWork(PGconn *conn,
+         throw std::runtime_error(PQerrorMessage(conn));
+ 
+     // 2.4 wait for process Result return
+-    res = PQgetResult(conn);
+-    if (res == NULL)
++    //
++    // NOTE: we deliberately collect *every* PGresult this backend emits, not
++    // just the first one. A half-drained result stream would leak into the
++    // next query executed on the same PGconn and desynchronise the protocol,
++    // which under high concurrency manifests as bogus "replyShift" values
++    // that then fail SerializedDataNextSeveralItemSize and surface as
++    // "response is corrupt.".
++    std::vector<PGresult *> resultList;
++    PGresultVecGuard resultListGuard(resultList);
++    while ((res = PQgetResult(conn)) != NULL) {
++        resultList.push_back(res);
++    }
++    if (resultList.empty())
+         throw std::runtime_error(PQerrorMessage(conn));
+-    PGresultGuard resGuard(res);
++    /* The BatchWorkerTask issues exactly one SQL statement, so there should be
++     * exactly one PGresult carrying TUPLES; anything else means the protocol
++     * stream is in an unexpected state and we must not try to interpret the
++     * first row as a valid replyShift. */
++    PGresult *mainRes = resultList.front();
+     for (auto &job : m_jobList) {
+         int32_t si = job->statArrayIndex;
+         if (si >= 0 && g_FalconPerRequestStatShmem != nullptr)
+@@ -437,8 +484,8 @@ void BatchWorkerTask::DoWork(PGconn *conn,
+     FalconErrorCode errorCode = SUCCESS;
+     paramGuard.release();
+     statIndicesGuard.release();
+-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+-        char *totalErrorMsg = PQresultErrorMessage(res);
++    if (PQresultStatus(mainRes) != PGRES_TUPLES_OK) {
++        char *totalErrorMsg = PQresultErrorMessage(mainRes);
+         const char *validErrorMsg = NULL;
+         errorCode = FalconErrorMsgAnalyse(totalErrorMsg, &validErrorMsg);
+         if (errorCode == SUCCESS)
+@@ -452,9 +499,13 @@ void BatchWorkerTask::DoWork(PGconn *conn,
+         auto metaResponse = falcon::meta_fbs::CreateMetaResponse(flatBufferBuilder, errorCode);
+         flatBufferBuilder.Finish(metaResponse);
+         char *buf = SerializedDataApplyForSegment(&replyBuilder, flatBufferBuilder.GetSize());
++        if (buf == nullptr)
++            throw std::runtime_error("failed to build error reply segment.");
+         memcpy(buf, flatBufferBuilder.GetBufferPointer(), flatBufferBuilder.GetSize());
+         for (size_t i = 0; i < m_jobList.size(); ++i) {
+             char *data = (char *)malloc(replyBuilder.size);
++            if (data == nullptr)
++                throw std::runtime_error("malloc failed for error reply.");
+             memcpy(data, replyBuilder.buffer, replyBuilder.size);
+             // 2.5.1 SendResponse & clear resource
+             m_jobList[i]->ProcessResponse(data, replyBuilder.size, NULL);
+@@ -470,34 +521,85 @@ void BatchWorkerTask::DoWork(PGconn *conn,
+             m_jobList[i] = nullptr;
+         }
+     } else {
+-        if (PQntuples(res) != 1 || PQnfields(res) != 1) {
++        if (PQntuples(mainRes) != 1 || PQnfields(mainRes) != 1) {
+             throw std::runtime_error("returned reply is corrupt.");
+         }
+         uint64_t replyShift = 0;
+-        replyShift = (uint64_t)StringToInt64(PQgetvalue(res, 0, 0));
++        replyShift = (uint64_t)StringToInt64(PQgetvalue(mainRes, 0, 0));
+         if (replyShift != 0) {
++            /* Validate replyShift falls into the allocator's addressable range
++             * BEFORE we touch the header.  A bogus value coming back from the
++             * protocol layer (e.g. stale result from a previous request, or a
++             * confused backend) would otherwise cause us to dereference an
++             * arbitrary pointer inside shared memory. */
++            const uint64_t maxShift =
++                (uint64_t)m_allocator->pageCount * FALCON_SHMEM_ALLOCATOR_PAGE_SIZE;
++            if (replyShift < sizeof(MemoryHdr) || replyShift >= maxShift)
++                throw std::runtime_error("returned replyShift is out of range.");
++
+             ShmemAllocGuard replyGuard(m_allocator, replyShift);
+             char *replyBuffer = FALCON_SHMEM_ALLOCATOR_GET_POINTER(m_allocator, replyShift);
++
++            /* Verify the signature the backend stamped onto the reply header
++             * matches the one we generated for this batch. If this check is
++             * skipped (as it was previously), a racing / stale pointer can let
++             * us read an unrelated, possibly freed buffer whose bytes happen
++             * to be 4-byte aligned -- in which case the subsequent
++             * SerializedDataNextSeveralItemSize would eventually return -1
++             * and the connection worker would abort with "response is
++             * corrupt.".  SingleWorkerTask already performs this validation;
++             * BatchWorkerTask must do the same. */
++            if (FALCON_SHMEM_ALLOCATOR_GET_SIGNATURE(replyBuffer) != signature)
++                throw std::runtime_error("returned reply is corrupt (signature mismatch).");
++
+             uint64_t replyBufferSize = FALCON_SHMEM_ALLOCATOR_POINTER_GET_SIZE(replyBuffer);
++            /* Reject obviously invalid sizes up-front. replyBufferSize must
++             * fit in sd_size_t (uint32_t) and be 4-byte aligned; otherwise
++             * SerializedDataInit will reject it and we would throw an
++             * opaque "reply data is corrupt." farther down. */
++            if (replyBufferSize > (uint64_t)SD_SIZE_T_MAX ||
++                (replyBufferSize & SERIALIZED_DATA_ALIGNMENT_MASK) != 0)
++                throw std::runtime_error("reply buffer size is invalid.");
++
+             SerializedData replyData;
+-            if (!SerializedDataInit(&replyData, replyBuffer, replyBufferSize, replyBufferSize, NULL))
++            if (!SerializedDataInit(&replyData, replyBuffer, (sd_size_t)replyBufferSize,
++                                    (sd_size_t)replyBufferSize, NULL))
+                 throw std::runtime_error("reply data is corrupt.");
+ 
+             uint32_t p = 0;
+-            std::vector<std::pair<char*, uint32_t>> replyParts(m_jobList.size());
++            std::vector<std::pair<char *, uint32_t>> replyParts(m_jobList.size(),
++                                                                {nullptr, 0});
++            /* On any exception below (e.g. SerializedDataNextSeveralItemSize
++             * returning -1), this guard free()s every entry already malloc'd
++             * in this loop, preventing the heap leak that the original code
++             * had in its abort path. */
++            ReplyPartsGuard replyPartsGuard(replyParts);
+             for (size_t i = 0; i < m_jobList.size(); ++i) {
+                 int count = m_jobList[i]->GetReqServiceCnt();
+-                uint32_t size = SerializedDataNextSeveralItemSize(&replyData, p, count);
+-                if (size == (sd_size_t)-1)
++                sd_size_t size = SerializedDataNextSeveralItemSize(&replyData, p, count);
++                if (size == (sd_size_t)-1 || size == 0)
++                    throw std::runtime_error("response is corrupt.");
++                /* Defence in depth: p + size must stay within replyData.size
++                 * AND must not wrap around uint32_t.  The helper already
++                 * validates this, but double-checking here keeps the client
++                 * side safe even if the helper's semantics drift. */
++                if ((uint64_t)p + (uint64_t)size > (uint64_t)replyData.size)
+                     throw std::runtime_error("response is corrupt.");
+                 char *data = (char *)malloc(size);
++                if (data == nullptr)
++                    throw std::runtime_error("malloc failed for reply part.");
+                 memcpy(data, replyBuffer + p, size);
+                 replyParts[i] = {data, size};
+                 p += size;
+             }
+             // 2.5.1 SendResponse & clear resource
+             for (size_t i = 0; i < m_jobList.size(); ++i) {
+-                m_jobList[i]->ProcessResponse(replyParts[i].first, replyParts[i].second, NULL);
++                /* Ownership of replyParts[i].first transfers to ProcessResponse
++                 * which frees via its own deleter. */
++                char *ownedData = replyParts[i].first;
++                uint32_t ownedSize = replyParts[i].second;
++                replyParts[i].first = nullptr;
++                m_jobList[i]->ProcessResponse(ownedData, ownedSize, NULL);
+                 {
+                     int32_t si = m_jobList[i]->statArrayIndex;
+                     if (si >= 0 && g_FalconPerRequestStatShmem != nullptr)
+@@ -509,6 +611,7 @@ void BatchWorkerTask::DoWork(PGconn *conn,
+                 delete m_jobList[i];
+                 m_jobList[i] = nullptr;
+             }
++            replyPartsGuard.dismiss();
+             replyGuard.release();
+         } else {
+             // 2.5.1 SendResponse & clear resource
+@@ -527,9 +630,7 @@ void BatchWorkerTask::DoWork(PGconn *conn,
+         }
+     }
+ 
+-    // 2.6 recycle resource
+-    for (size_t i = 0; i < m_jobList.size(); ++i) {
+-        delete m_jobList[i];
+-    }
++    // 2.6 clear job list; per-entry deletes have already been performed above
++    // (and each slot was nulled out), so there is nothing else to free here.
+     m_jobList.clear();
+ }
+diff --git a/remote_connection_def/remote_connection_utils/serialized_data.h b/remote_connection_def/remote_connection_utils/serialized_data.h
+index 1d18c21..721affe 100644
+--- a/remote_connection_def/remote_connection_utils/serialized_data.h
++++ b/remote_connection_def/remote_connection_utils/serialized_data.h
+@@ -146,23 +146,57 @@ bool SerializedDataAppend(SerializedData *dest, const SerializedData *src)
+ }
+ 
+ // start must be the start point of next item
++//
++// Robustness notes (hardened against corrupt / concurrently-clobbered buffers):
++//   1. start must be aligned AND must not be outside [0, data->size]; otherwise
++//      the first header read would be an out-of-bounds access.
++//   2. Before dereferencing each item-size header, we must ensure at least
++//      SERIALIZED_DATA_ALIGNMENT bytes of header are available (never trust the
++//      bytes we are about to read). Previously the loop could read one header
++//      past end-of-buffer when an earlier pass happened to land p exactly on
++//      data->size.
++//   3. The declared itemSize is an untrusted 32-bit value coming from a shared
++//      memory buffer. Compute the per-iteration advance (4 + itemSize) in a
++//      wider type and validate it stays within the remaining buffer, so that
++//      neither the intermediate sum nor p can wrap around sd_size_t (uint32_t)
++//      and silently escape the "p > buffer_end" check.
+ sd_size_t SerializedDataNextSeveralItemSize(SerializedData *data, sd_size_t start, uint32_t itemCount)
+ {
++    if (data == NULL || data->buffer == NULL)
++        return -1;
+     if ((start & SERIALIZED_DATA_ALIGNMENT_MASK) != 0)
+         return -1;
+-    char *p = data->buffer + start;
++    /* start must point into (or right at the end of) the valid region; being
++     * exactly at data->size is only valid when itemCount == 0. */
++    if (start > data->size)
++        return -1;
++    if (itemCount == 0)
++        return 0;
++
++    sd_size_t cursor = start;
++    const sd_size_t end = data->size;
+     while (itemCount) {
+-        sd_size_t itemSize = *(sd_size_t *)p;
++        /* Require a full size header to be inside the buffer before reading */
++        if (cursor > end || (sd_size_t)(end - cursor) < (sd_size_t)SERIALIZED_DATA_ALIGNMENT)
++            return -1;
++
++        sd_size_t itemSize = *(const sd_size_t *)(data->buffer + cursor);
+         if (!SystemIsLittleEndian())
+             itemSize = ConvertBetweenBigAndLittleEndian(itemSize);
+         if ((itemSize & SERIALIZED_DATA_ALIGNMENT_MASK) != 0)
+             return -1;
+-        p += SERIALIZED_DATA_ALIGNMENT + itemSize;
+-        if (p > data->buffer + data->size)
++
++        /* Compute advance in 64-bit to defeat any 32-bit wrap-around coming
++         * from a maliciously-large or corrupted itemSize field. */
++        uint64_t advance = (uint64_t)SERIALIZED_DATA_ALIGNMENT + (uint64_t)itemSize;
++        uint64_t nextCursor = (uint64_t)cursor + advance;
++        if (nextCursor > (uint64_t)end)
+             return -1;
++
++        cursor = (sd_size_t)nextCursor;
+         --itemCount;
+     }
+-    return (sd_size_t)(p - data->buffer) - start;
++    return cursor - start;
+ }
+ 
+ static bool SerializedDataEnlarge(SerializedData *data, sd_size_t size)
