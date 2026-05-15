@@ -1,0 +1,1 @@
+请问python_interface/_pyfalconfs_internal/_pyfalconfs_internal.cpp中的PyWrapper_AsyncPut函数，可以通过PyObject* self和PyObject* args这两个入参来判断当前是Python进程的哪一条协程调用的接口吗？
