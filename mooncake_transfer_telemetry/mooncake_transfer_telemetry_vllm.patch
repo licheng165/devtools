@@ -1,0 +1,884 @@
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_metrics.py b/tests/v1/kv_connector/unit/test_mooncake_metrics.py
+new file mode 100644
+index 000000000..7b54fa563
+--- /dev/null
++++ b/tests/v1/kv_connector/unit/test_mooncake_metrics.py
+@@ -0,0 +1,336 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Unit tests for mooncake_metrics telemetry module."""
++
++import threading
++from typing import Any
++
++import pytest
++
++from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_metrics import (
++    KVBufferRegion,
++    MooncakeIOObservation,
++    MooncakeIOStats,
++    MooncakeIOStatsCollector,
++    classify_network_type,
++    record_mooncake_io,
++)
++
++
++class TestClassifyNetworkType:
++    """Tests for the path-inference network-type classifier."""
++
++    def test_no_submission_returns_none(self):
++        net, src = classify_network_type(
++            component="p2p",
++            local_regions=[KVBufferRegion(0, 100, "npu")],
++            remote_regions=[KVBufferRegion(0, 100, "npu")],
++            submitted=False,
++            attempted_bytes=0,
++        )
++        assert net == "none"
++        assert src == "path_inference"
++
++    def test_zero_bytes_returns_none(self):
++        net, src = classify_network_type(
++            component="p2p",
++            local_regions=[KVBufferRegion(0, 100, "npu")],
++            remote_regions=[KVBufferRegion(0, 100, "npu")],
++            submitted=True,
++            attempted_bytes=0,
++        )
++        assert net == "none"
++
++    def test_p2p_npu_both_sides(self):
++        net, src = classify_network_type(
++            component="p2p",
++            local_regions=[KVBufferRegion(0, 100, "npu")],
++            remote_regions=[KVBufferRegion(0, 100, "npu")],
++        )
++        assert net == "npu_side"
++        assert src == "path_inference"
++
++    def test_p2p_host_both_sides(self):
++        net, src = classify_network_type(
++            component="p2p",
++            local_regions=[KVBufferRegion(0, 100, "cpu")],
++            remote_regions=[KVBufferRegion(0, 100, "host")],
++        )
++        assert net == "host_side"
++
++    def test_p2p_mixed_npu_host(self):
++        net, src = classify_network_type(
++            component="p2p",
++            local_regions=[KVBufferRegion(0, 100, "npu")],
++            remote_regions=[KVBufferRegion(0, 100, "cpu")],
++        )
++        assert net == "unknown"
++        assert src == "unresolved"
++
++    def test_p2p_missing_remote(self):
++        net, src = classify_network_type(
++            component="p2p",
++            local_regions=[KVBufferRegion(0, 100, "npu")],
++            remote_regions=None,
++        )
++        assert net == "unknown"
++
++    def test_store_npu(self):
++        net, src = classify_network_type(
++            component="store",
++            local_regions=[KVBufferRegion(0, 100, "npu")],
++        )
++        assert net == "npu_side"
++
++    def test_store_host(self):
++        net, src = classify_network_type(
++            component="store",
++            local_regions=[KVBufferRegion(0, 100, "cpu")],
++        )
++        assert net == "host_side"
++
++    def test_store_empty_regions(self):
++        net, src = classify_network_type(
++            component="store",
++            local_regions=[],
++        )
++        assert net == "unknown"
++
++
++class TestMooncakeIOStats:
++    """Tests for the stats container."""
++
++    def test_empty_stats(self):
++        stats = MooncakeIOStats(data={})
++        assert stats.is_empty()
++
++    def test_record_and_drain(self):
++        collector = MooncakeIOStatsCollector()
++        record_mooncake_io(
++            collector,
++            component="p2p",
++            operation="read",
++            outcome="success",
++            error_kind="none",
++            attempted_bytes=1024,
++            completed_bytes=1024,
++            operations=10,
++            descriptors=10,
++            duration_seconds=0.001,
++            network_type="npu_side",
++            network_type_source="path_inference",
++            transfer_id="t1",
++        )
++        drained = collector.drain()
++        assert drained is not None
++        assert not drained.is_empty()
++        totals = drained.data["totals"]
++        assert len(totals) == 1
++        key = list(totals.keys())[0]
++        assert totals[key]["calls"] == 1
++        assert totals[key]["attempted_bytes"] == 1024
++        assert totals[key]["completed_bytes"] == 1024
++        assert "t1" in drained.data["logical_transfer_ids"]
++
++    def test_drain_clears(self):
++        collector = MooncakeIOStatsCollector()
++        record_mooncake_io(
++            collector,
++            component="p2p",
++            operation="read",
++            outcome="success",
++            error_kind="none",
++            attempted_bytes=100,
++            completed_bytes=100,
++            operations=1,
++            descriptors=1,
++            duration_seconds=0.01,
++            network_type="npu_side",
++            network_type_source="path_inference",
++        )
++        drained = collector.drain()
++        assert drained is not None
++        # Second drain should be None.
++        drained2 = collector.drain()
++        assert drained2 is None
++
++    def test_aggregate(self):
++        s1 = MooncakeIOStats(data={})
++        s1.record(
++            MooncakeIOObservation(
++                component="p2p",
++                operation="read",
++                outcome="success",
++                error_kind="none",
++                network_type="npu_side",
++                network_type_source="path_inference",
++                attempted_bytes=100,
++                completed_bytes=100,
++                operations=1,
++                descriptors=1,
++                duration_seconds=0.001,
++                transfer_id="t1",
++            )
++        )
++        s2 = MooncakeIOStats(data={})
++        s2.record(
++            MooncakeIOObservation(
++                component="p2p",
++                operation="read",
++                outcome="success",
++                error_kind="none",
++                network_type="npu_side",
++                network_type_source="path_inference",
++                attempted_bytes=200,
++                completed_bytes=200,
++                operations=2,
++                descriptors=2,
++                duration_seconds=0.002,
++                transfer_id="t1",
++            )
++        )
++        s1.aggregate(s2)
++        totals = s1.data["totals"]
++        key = list(totals.keys())[0]
++        assert totals[key]["calls"] == 2
++        assert totals[key]["attempted_bytes"] == 300
++        assert totals[key]["completed_bytes"] == 300
++        # transfer_id dedup
++        assert s1.data["logical_transfer_ids"] == ["t1"]
++
++    def test_failed_no_completed_bytes(self):
++        collector = MooncakeIOStatsCollector()
++        record_mooncake_io(
++            collector,
++            component="p2p",
++            operation="read",
++            outcome="error",
++            error_kind="return_code",
++            attempted_bytes=1024,
++            completed_bytes=None,
++            operations=10,
++            descriptors=10,
++            duration_seconds=0.001,
++            network_type="npu_side",
++            network_type_source="path_inference",
++        )
++        drained = collector.drain()
++        totals = drained.data["totals"]
++        key = list(totals.keys())[0]
++        assert totals[key]["completed_bytes"] == 0
++        assert "error" in key
++
++    def test_reduce(self):
++        collector = MooncakeIOStatsCollector()
++        for i in range(5):
++            record_mooncake_io(
++                collector,
++                component="store",
++                operation="put",
++                outcome="success",
++                error_kind="none",
++                attempted_bytes=100 * (i + 1),
++                completed_bytes=100 * (i + 1),
++                operations=i + 1,
++                descriptors=i + 1,
++                duration_seconds=0.001 * (i + 1),
++                network_type="npu_side",
++                network_type_source="path_inference",
++            )
++        drained = collector.drain()
++        reduced = drained.reduce()
++        assert reduced["store_put_success_npu_side_calls"] == 5
++        assert reduced["store_put_success_npu_side_attempted_bytes"] == 1500
++        assert reduced["store_put_success_npu_side_completed_bytes"] == 1500
++
++
++class TestThreadSafety:
++    """Tests for concurrent record/drain."""
++
++    def test_concurrent_record_drain(self):
++        collector = MooncakeIOStatsCollector()
++        stop = threading.Event()
++        record_count = [0]
++        record_lock = threading.Lock()
++
++        def recorder():
++            while not stop.is_set():
++                record_mooncake_io(
++                    collector,
++                    component="p2p",
++                    operation="read",
++                    outcome="success",
++                    error_kind="none",
++                    attempted_bytes=100,
++                    completed_bytes=100,
++                    operations=1,
++                    descriptors=1,
++                    duration_seconds=0.0001,
++                    network_type="npu_side",
++                    network_type_source="path_inference",
++                )
++                with record_lock:
++                    record_count[0] += 1
++
++        threads = [threading.Thread(target=recorder, daemon=True) for _ in range(4)]
++        for t in threads:
++            t.start()
++
++        total_drained_calls = 0
++        for _ in range(10):
++            drained = collector.drain()
++            if drained is not None:
++                for t in drained.data.get("totals", {}).values():
++                    total_drained_calls += t["calls"]
++            threading.Event().wait(0.001)
++
++        stop.set()
++        for t in threads:
++            t.join(timeout=1)
++
++        # All recorded events should be either in the collector or drained.
++        # No events lost or double counted.
++        final_drain = collector.drain()
++        final_calls = 0
++        if final_drain is not None:
++            for t in final_drain.data.get("totals", {}).values():
++                final_calls += t["calls"]
++
++        assert total_drained_calls + final_calls == record_count[0]
++
++
++class TestSerialization:
++    """Tests for dataclass serialization (cross-process)."""
++
++    def test_stats_is_plain_dict(self):
++        collector = MooncakeIOStatsCollector()
++        record_mooncake_io(
++            collector,
++            component="p2p",
++            operation="read",
++            outcome="success",
++            error_kind="none",
++            attempted_bytes=42,
++            completed_bytes=42,
++            operations=1,
++            descriptors=1,
++            duration_seconds=0.001,
++            network_type="npu_side",
++            network_type_source="path_inference",
++            transfer_id="t1",
++        )
++        drained = collector.drain()
++        # data must be serializable as plain dict for cross-process.
++        data: dict[str, Any] = drained.data
++        assert isinstance(data, dict)
++        assert isinstance(data["totals"], dict)
++        assert isinstance(data["durations"], dict)
++        assert isinstance(data["logical_transfer_ids"], list)
++
++        # Reconstruct from serialized data.
++        rebuilt = MooncakeIOStats(data=data)
++        assert not rebuilt.is_empty()
++        totals = rebuilt.data["totals"]
++        key = list(totals.keys())[0]
++        assert totals[key]["calls"] == 1
++        assert "t1" in rebuilt.data["logical_transfer_ids"]
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_metrics.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_metrics.py
+new file mode 100644
+index 000000000..7e00c5322
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_metrics.py
+@@ -0,0 +1,484 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Reusable Mooncake network-IO telemetry for KV connectors.
++
++This module is device-agnostic (no torch/npu imports) so it can be unit
++tested on CPU-only machines and shared by:
++
++* vLLM-Ascend ``MooncakeConnectorV1`` (P2P direct transfer)
++* vLLM-Ascend ``AscendStoreConnector`` (Mooncake-backed KV pool)
++* upstream vLLM ``MooncakeConnector``
++* LMCache ``MooncakestoreConnector`` (host-side staging path)
++
++Design invariants
++-----------------
++1. Stats are recorded once at the *outermost* semantic Mooncake API call.
++2. The shared ``GlobalTE`` is never instrumented or drained.
++3. P2P transfers are counted only on the side that issues the Mooncake
++   read/write, avoiding P/D double counting.
++4. Store ``put`` and ``get`` are two distinct IO phases and are counted
++   separately.
++5. TP/PP worker aggregation sums payload bytes directly (each rank owns
++   a different KV shard); no ``/TP`` or ``/DP`` division is applied.
++6. ``network_type`` is *path-inferred* from the runtime connector path
++   and registered buffer memory kind -- it is **not** a native report
++   from Mooncake C++.  ``network_type_source`` distinguishes
++   ``path_inference`` from ``unresolved`` so downstream consumers know
++   the confidence level.
++7. Latency uses ``time.perf_counter_ns`` (monotonic).  Cross-node
++   correlation additionally records ``time.time_ns`` (wall clock) in
++   structured logs only.
++8. No additional ``torch.npu.synchronize()`` is introduced.
++"""
++
++from __future__ import annotations
++
++import copy
++import json
++import threading
++import time
++from dataclasses import dataclass
++from typing import Any, Literal
++
++from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++# ---------------------------------------------------------------------------
++# Constants
++# ---------------------------------------------------------------------------
++
++NetworkType = Literal["npu_side", "host_side", "none", "unknown"]
++NetworkTypeSource = Literal["path_inference", "unresolved"]
++Component = Literal["p2p", "store"]
++Operation = Literal["read", "write", "get", "put"]
++Outcome = Literal["success", "partial", "error", "skip"]
++ErrorKind = Literal[
++    "none", "return_code", "exception", "invalid_result", "skipped"
++]
++
++# Memory kinds that map to NPU data plane.
++_NPU_MEMORY_KINDS = frozenset({"npu", "ascend"})
++
++
++# ---------------------------------------------------------------------------
++# Data classes
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class KVBufferRegion:
++    """A registered KV-cache buffer region.
++
++    ``memory_kind`` is derived from the tensor's ``device.type`` at
++    registration time (e.g. ``"npu"``, ``"cuda"``, ``"cpu"``).  It is a
++    *memory fact*, not a network fact, but it is the strongest signal
++    available without modifying Mooncake C++ bindings.
++    """
++
++    base_address: int
++    length: int
++    memory_kind: str
++    device_index: int | None = None
++
++
++@dataclass(frozen=True)
++class MooncakeIOObservation:
++    """A single Mooncake data-plane API call observation."""
++
++    component: Component
++    operation: Operation
++    outcome: Outcome
++    error_kind: ErrorKind
++    network_type: NetworkType
++    network_type_source: NetworkTypeSource
++    attempted_bytes: int
++    completed_bytes: int | None  # None when partial completion is unobservable
++    operations: int  # logical ops (P2P descriptors, Store keys)
++    descriptors: int  # physical buffer descriptors submitted
++    duration_seconds: float
++    # Optional phase durations (seconds).  Only meaningful for P2P.
++    queue_duration_seconds: float | None = None
++    prepare_duration_seconds: float | None = None
++    postprocess_duration_seconds: float | None = None
++    # Opaque transfer id for in-process dedup only.
++    transfer_id: str | None = None
++
++
++# ---------------------------------------------------------------------------
++# Network-type path inference
++# ---------------------------------------------------------------------------
++
++
++def classify_network_type(
++    component: Component,
++    local_regions: list[KVBufferRegion] | None,
++    remote_regions: list[KVBufferRegion] | None = None,
++    submitted: bool = True,
++    attempted_bytes: int = 0,
++) -> tuple[NetworkType, NetworkTypeSource]:
++    """Path-infer ``network_type`` from runtime facts.
++
++    The classifier never reads IPs, NIC names, environment variables, or
++    the Mooncake config file.  It relies solely on:
++
++    * the connector/backend Python type (``component``)
++    * the registered buffer memory kinds (``local_regions`` /
++      ``remote_regions``)
++
++    Returns ``(network_type, network_type_source)``.
++    """
++    if not submitted or attempted_bytes == 0:
++        return "none", "path_inference"
++
++    local_kinds: set[str] = set()
++    if local_regions:
++        for r in local_regions:
++            local_kinds.add(r.memory_kind)
++    remote_kinds: set[str] = set()
++    if remote_regions:
++        for r in remote_regions:
++            remote_kinds.add(r.memory_kind)
++
++    if component == "store":
++        # Store multi-buffer APIs receive addresses from the caller's
++        # registered KV tensors.  If all local regions are NPU memory,
++        # the payload is inferred to travel on the NPU side.
++        if local_kinds and local_kinds <= _NPU_MEMORY_KINDS:
++            return "npu_side", "path_inference"
++        if local_kinds and local_kinds <= {"cpu", "host"}:
++            return "host_side", "path_inference"
++        return "unknown", "unresolved"
++
++    # P2P direct transfer: both sides must be resolved.
++    if not local_kinds or not remote_kinds:
++        return "unknown", "unresolved"
++
++    if local_kinds <= _NPU_MEMORY_KINDS and remote_kinds <= _NPU_MEMORY_KINDS:
++        return "npu_side", "path_inference"
++    if local_kinds <= {"cpu", "host"} and remote_kinds <= {"cpu", "host"}:
++        return "host_side", "path_inference"
++    # Mixed or non-NPU/non-host device.
++    return "unknown", "unresolved"
++
++
++# ---------------------------------------------------------------------------
++# Stats container
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class MooncakeIOStats(KVConnectorStats):
++    """Serializable container for Mooncake IO observations.
++
++    ``data`` has the shape::
++
++        {
++            "schema_version": 1,
++            "totals": {
++                "<component>|<operation>|<outcome>|<network_type>|"
++                "<network_type_source>|<error_kind>": {
++                    "calls": int,
++                    "attempted_bytes": int,
++                    "completed_bytes": int,   # 0 if unobservable
++                    "operations": int,
++                    "descriptors": int,
++                },
++                ...
++            },
++            "durations": {
++                "<same key>": [float, ...],
++            },
++            "logical_transfer_ids": [str, ...],
++        }
++    """
++
++    def __post_init__(self):
++        if not self.data:
++            self.reset()
++
++    def reset(self):
++        self.data: dict[str, Any] = {
++            "schema_version": 1,
++            "totals": {},
++            "durations": {},
++            "logical_transfer_ids": [],
++        }
++
++    @staticmethod
++    def _key(obs: MooncakeIOObservation) -> str:
++        return "|".join([
++            obs.component,
++            obs.operation,
++            obs.outcome,
++            obs.network_type,
++            obs.network_type_source,
++            obs.error_kind,
++        ])
++
++    def record(self, obs: MooncakeIOObservation) -> None:
++        key = self._key(obs)
++        totals = self.data["totals"]
++        if key not in totals:
++            totals[key] = {
++                "calls": 0,
++                "attempted_bytes": 0,
++                "completed_bytes": 0,
++                "operations": 0,
++                "descriptors": 0,
++            }
++        t = totals[key]
++        t["calls"] += 1
++        t["attempted_bytes"] += obs.attempted_bytes
++        if obs.completed_bytes is not None:
++            t["completed_bytes"] += obs.completed_bytes
++        t["operations"] += obs.operations
++        t["descriptors"] += obs.descriptors
++
++        durations = self.data["durations"]
++        if key not in durations:
++            durations[key] = []
++        durations[key].append(obs.duration_seconds)
++
++        if obs.transfer_id is not None:
++            ids = self.data["logical_transfer_ids"]
++            if obs.transfer_id not in ids:
++                ids.append(obs.transfer_id)
++
++    def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
++        if not isinstance(other, MooncakeIOStats):
++            return self
++        if other.is_empty():
++            return self
++
++        for key, other_t in other.data.get("totals", {}).items():
++            my_t = self.data["totals"].setdefault(key, {
++                "calls": 0,
++                "attempted_bytes": 0,
++                "completed_bytes": 0,
++                "operations": 0,
++                "descriptors": 0,
++            })
++            my_t["calls"] += other_t["calls"]
++            my_t["attempted_bytes"] += other_t["attempted_bytes"]
++            my_t["completed_bytes"] += other_t["completed_bytes"]
++            my_t["operations"] += other_t["operations"]
++            my_t["descriptors"] += other_t["descriptors"]
++
++        for key, other_durs in other.data.get("durations", {}).items():
++            self.data["durations"].setdefault(key, []).extend(other_durs)
++
++        existing_ids = set(self.data.get("logical_transfer_ids", []))
++        for tid in other.data.get("logical_transfer_ids", []):
++            if tid not in existing_ids:
++                self.data["logical_transfer_ids"].append(tid)
++                existing_ids.add(tid)
++
++        return self
++
++    def reduce(self) -> dict[str, int | float]:
++        result: dict[str, int | float] = {}
++        for key, t in self.data.get("totals", {}).items():
++            parts = key.split("|")
++            prefix = f"{parts[0]}_{parts[1]}_{parts[2]}_{parts[3]}"
++            result[f"{prefix}_calls"] = t["calls"]
++            result[f"{prefix}_attempted_bytes"] = t["attempted_bytes"]
++            result[f"{prefix}_completed_bytes"] = t["completed_bytes"]
++            result[f"{prefix}_operations"] = t["operations"]
++            result[f"{prefix}_descriptors"] = t["descriptors"]
++        for key, durs in self.data.get("durations", {}).items():
++            parts = key.split("|")
++            prefix = f"{parts[0]}_{parts[1]}_{parts[2]}_{parts[3]}"
++            if durs:
++                avg = sum(durs) / len(durs)
++                sorted_durs = sorted(durs)
++                p99_idx = min(int(len(sorted_durs) * 0.99), len(sorted_durs) - 1)
++                result[f"{prefix}_avg_duration_ms"] = round(avg * 1e3, 3)
++                result[f"{prefix}_p99_duration_ms"] = round(
++                    sorted_durs[p99_idx] * 1e3, 3
++                )
++        result["logical_transfers"] = len(
++            self.data.get("logical_transfer_ids", [])
++        )
++        return result
++
++    def is_empty(self) -> bool:
++        return not self.data.get("totals") and not self.data.get(
++            "durations"
++        )
++
++    def clone_and_reset(self) -> MooncakeIOStats:
++        old = copy.copy(self)
++        old.data = copy.deepcopy(self.data)
++        self.reset()
++        return old
++
++
++# ---------------------------------------------------------------------------
++# Thread-safe collector
++# ---------------------------------------------------------------------------
++
++
++class MooncakeIOStatsCollector:
++    """Thread-safe accumulator for :class:`MooncakeIOObservation`.
++
++    Multiple background transfer threads may call :meth:`record`
++    concurrently while the model-runner thread calls :meth:`drain` once
++    per engine step.  Drain atomically swaps internal containers so no
++    observations are lost or double-counted.
++    """
++
++    def __init__(self):
++        self._lock = threading.Lock()
++        self._stats = MooncakeIOStats(data={})
++
++    def record(self, obs: MooncakeIOObservation) -> None:
++        with self._lock:
++            self._stats.record(obs)
++
++    def drain(self) -> MooncakeIOStats | None:
++        with self._lock:
++            if self._stats.is_empty():
++                return None
++            old = self._stats.clone_and_reset()
++            return old
++
++    def peek(self) -> MooncakeIOStats:
++        """Return a deep copy without clearing (for testing)."""
++        with self._lock:
++            return copy.deepcopy(self._stats)
++
++
++# ---------------------------------------------------------------------------
++# Convenience: build an observation + record in one call
++# ---------------------------------------------------------------------------
++
++
++def record_mooncake_io(
++    collector: MooncakeIOStatsCollector,
++    *,
++    component: Component,
++    operation: Operation,
++    outcome: Outcome,
++    error_kind: ErrorKind,
++    attempted_bytes: int,
++    completed_bytes: int | None,
++    operations: int,
++    descriptors: int,
++    duration_seconds: float,
++    network_type: NetworkType,
++    network_type_source: NetworkTypeSource,
++    transfer_id: str | None = None,
++    queue_duration_seconds: float | None = None,
++    prepare_duration_seconds: float | None = None,
++    postprocess_duration_seconds: float | None = None,
++) -> None:
++    """Record a single Mooncake IO observation on *collector*."""
++    collector.record(
++        MooncakeIOObservation(
++            component=component,
++            operation=operation,
++            outcome=outcome,
++            error_kind=error_kind,
++            network_type=network_type,
++            network_type_source=network_type_source,
++            attempted_bytes=attempted_bytes,
++            completed_bytes=completed_bytes,
++            operations=operations,
++            descriptors=descriptors,
++            duration_seconds=duration_seconds,
++            transfer_id=transfer_id,
++            queue_duration_seconds=queue_duration_seconds,
++            prepare_duration_seconds=prepare_duration_seconds,
++            postprocess_duration_seconds=postprocess_duration_seconds,
++        )
++    )
++
++
++# ---------------------------------------------------------------------------
++# Structured event logging helper
++# ---------------------------------------------------------------------------
++
++_call_seq_counter = 0
++_call_seq_lock = threading.Lock()
++
++
++def _next_call_seq() -> int:
++    global _call_seq_counter
++    with _call_seq_lock:
++        _call_seq_counter += 1
++        return _call_seq_counter
++
++
++def log_mooncake_io_event(
++    event: str,
++    *,
++    component: Component,
++    operation: Operation,
++    outcome: Outcome,
++    network_type: NetworkType,
++    network_type_source: NetworkTypeSource,
++    attempted_bytes: int,
++    completed_bytes: int | None,
++    operations: int,
++    descriptors: int,
++    duration_ns: int,
++    transfer_id: str | None = None,
++    request_id: str | None = None,
++    remote_request_id: str | None = None,
++    engine_id: str | None = None,
++    dp_rank: int | None = None,
++    tp_rank: int | None = None,
++    pid: int | None = None,
++    local_memory_kind: str | None = None,
++    remote_memory_kind: str | None = None,
++    extra: dict[str, Any] | None = None,
++) -> None:
++    """Emit a structured JSON log line for a Mooncake IO event.
++
++    High-cardinality fields (request_id, transfer_id, IP, etc.) go here,
++    **not** into Prometheus labels.
++    """
++    call_seq = _next_call_seq()
++    wall_time_ns = time.time_ns()
++
++    payload: dict[str, Any] = {
++        "schema": "mooncake_io.v1",
++        "event": event,
++        "wall_time_ns": wall_time_ns,
++        "duration_ns": duration_ns,
++        "call_seq": call_seq,
++        "component": component,
++        "operation": operation,
++        "outcome": outcome,
++        "network_type": network_type,
++        "network_type_source": network_type_source,
++        "attempted_bytes": attempted_bytes,
++        "operations": operations,
++        "descriptors": descriptors,
++    }
++    if completed_bytes is not None:
++        payload["completed_bytes"] = completed_bytes
++    if transfer_id is not None:
++        payload["transfer_id"] = transfer_id
++    if request_id is not None:
++        payload["request_id"] = request_id
++    if remote_request_id is not None:
++        payload["remote_request_id"] = remote_request_id
++    if engine_id is not None:
++        payload["engine_id"] = engine_id
++    if dp_rank is not None:
++        payload["dp_rank"] = dp_rank
++    if tp_rank is not None:
++        payload["tp_rank"] = tp_rank
++    if pid is not None:
++        payload["pid"] = pid
++    if local_memory_kind is not None:
++        payload["local_memory_kind"] = local_memory_kind
++    if remote_memory_kind is not None:
++        payload["remote_memory_kind"] = remote_memory_kind
++    if extra:
++        payload.update(extra)
++
++    logger.info("MooncakeIO %s", json.dumps(payload, sort_keys=True))
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+index 7cc80129a..582c6da19 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -538,16 +538,25 @@ class MultiConnector(KVConnectorBase_V1):
+         return MultiKVConnectorStats(data=reconstructed_data)
+ 
+     def get_kv_connector_stats(self) -> MultiKVConnectorStats | None:
+-        # Group connector stats by connector type.
++        # Group connector stats by connector registration name.
++        # Using __class__.__name__ breaks when a registration name maps
++        # to a different Python class name (e.g. vLLM-Ascend registers
++        # "MooncakeConnectorV1" -> class MooncakeConnector, which would
++        # collide with upstream vLLM's "MooncakeConnector" registration).
+         stats_by_connector: MultiKVConnectorStats | None = None
+-        for c in self._connectors:
++        for i, c in enumerate(self._connectors):
+             stats = c.get_kv_connector_stats()
+             if stats is None:
+                 continue
+             if stats_by_connector is None:
+                 # Lazy init to allow optional return value.
+                 stats_by_connector = MultiKVConnectorStats()
+-            stats_by_connector[c.__class__.__name__] = stats
++            connector_name = (
++                self._ktc_kv_transfer_config[i].kv_connector
++                if i < len(self._ktc_kv_transfer_config)
++                else c.__class__.__name__
++            )
++            stats_by_connector[connector_name] = stats
+         return stats_by_connector
+ 
+     @classmethod
+@@ -566,7 +575,17 @@ class MultiConnector(KVConnectorBase_V1):
+                 temp_config, metric_types, labelnames, per_engine_labelvalues
+             )
+             if connector_prom is not None:
+-                prom_metrics[connector_cls.__name__] = connector_prom
++                # Use the registration name (kv_connector field) as the
++                # key so it matches get_kv_connector_stats() and the
++                # build_kv_connector_stats() reconstruction path.
++                connector_name = temp_config.kv_transfer_config.kv_connector
++                prom_metrics[connector_name] = connector_prom
++        # If no child connector provides Prometheus metrics, return None
++        # so that KVConnectorPrometheus.observe() becomes a no-op.
++        # Returning an empty MultiKVConnectorPromMetrics would cause an
++        # assertion failure in observe() when stats data is present.
++        if not prom_metrics:
++            return None
+         return MultiKVConnectorPromMetrics(
+             vllm_config,
+             metric_types,

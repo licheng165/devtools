@@ -1,0 +1,754 @@
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+index 95d05fdc8..d3ca94b77 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -9,6 +9,7 @@ import random
+ import struct
+ import threading
+ import time
++import uuid
+ from collections import OrderedDict, defaultdict, deque
+ from collections.abc import Iterator
+ from concurrent.futures import ThreadPoolExecutor
+@@ -31,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorMetadata,
+     KVConnectorRole,
+ )
++from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+ from vllm.distributed.parallel_state import (
+     get_decode_context_model_parallel_rank,
+     get_decode_context_model_parallel_world_size,
+@@ -52,6 +54,15 @@ from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import g
+ from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
+ from vllm_ascend.utils import enable_custom_op, is_vl_model
+ 
++from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_metrics import (
++    KVBufferRegion,
++    MooncakeIOStats,
++    MooncakeIOStatsCollector,
++    classify_network_type,
++    log_mooncake_io_event,
++    record_mooncake_io,
++)
++
+ # isort: off
+ if TYPE_CHECKING:
+     from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
+@@ -75,6 +86,10 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
+     kv_caches_base_addr: list[int]
+     num_blocks: int
+     local_ip: str = ""
++    # Fields for network-type path inference.  Optional for backward
++    # compatibility with peers that do not send them.
++    kv_caches_region_lengths: list[int] = []
++    kv_caches_memory_kinds: list[str] = []
+ 
+ 
+ @dataclass
+@@ -91,6 +106,9 @@ class ReqMeta:
+     remote_ptp_size: int | None
+     remote_multi_nodes_meta_mapping: dict[str, dict[str, Any]]
+     num_prompt_blocks: int
++    # Opaque transfer ID for cross-P/D log correlation.  May be None
++    # when the proxy or P side does not provide one.
++    transfer_id: str | None = None
+ 
+ 
+ @dataclass
+@@ -315,6 +333,8 @@ class KVCacheRecvingThread(threading.Thread):
+         vllm_config: VllmConfig,
+         kv_caches: dict[str, Any],
+         prefill_pp_layer_partition: str | None = None,
++        io_collector: MooncakeIOStatsCollector | None = None,
++        local_buffer_regions: list[KVBufferRegion] | None = None,
+     ):
+         super().__init__(daemon=True, name="KVCacheRecvingThread")
+         self.tp_rank = tp_rank
+@@ -369,6 +389,12 @@ class KVCacheRecvingThread(threading.Thread):
+                 self.num_kv_heads = max(self.model_config.hf_text_config.num_key_value_heads // self.tp_size, 1)
+         self.proc_not_transfer_request: dict[str, bool] = {}
+ 
++        # Mooncake IO stats
++        self._io_collector = io_collector
++        self._local_buffer_regions = local_buffer_regions or []
++        # Cached remote buffer regions per (engine_id, handshake_port).
++        self._remote_buffer_regions: dict[str, dict[int, list[KVBufferRegion]]] = SizedDict()
++
+     def add_request(
+         self,
+         request_id: str,
+@@ -382,6 +408,7 @@ class KVCacheRecvingThread(threading.Thread):
+         tp_num_need_pulls: int,
+         remote_port_send_num: dict[int, RemotePortInfo] | None = None,
+         all_task_done: bool = False,
++        transfer_id: str | None = None,
+     ):
+         """Add a new request to the queue for processing."""
+         if remote_port_send_num is None:
+@@ -400,6 +427,7 @@ class KVCacheRecvingThread(threading.Thread):
+                 "tp_num_need_pulls": tp_num_need_pulls,
+                 "remote_port_send_num": remote_port_send_num,
+                 "all_task_done": all_task_done,
++                "transfer_id": transfer_id,
+             }
+         )
+ 
+@@ -543,16 +571,115 @@ class KVCacheRecvingThread(threading.Thread):
+                 dst_list.append(dst)
+                 length_list.append(length)
+ 
++        prepare_end_time = time.perf_counter()
++        prepare_duration = prepare_end_time - req_start_time
++
++        # Mooncake data-plane API call -- instrumented.
++        transfer_start = time.perf_counter_ns()
+         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
++        transfer_end = time.perf_counter_ns()
++        transfer_duration_ns = transfer_end - transfer_start
++        transfer_duration_s = transfer_duration_ns / 1e9
++
++        attempted_bytes = sum(length_list)
++        num_descriptors = len(length_list)
++
++        # Path-infer network_type from local and remote buffer regions.
++        remote_regions: list[KVBufferRegion] = []
++        if remote_engine_id in self._remote_buffer_regions:
++            remote_regions = self._remote_buffer_regions[remote_engine_id].get(
++                remote_handshake_port, []
++            )
++        net_type, net_source = classify_network_type(
++            component="p2p",
++            local_regions=self._local_buffer_regions,
++            remote_regions=remote_regions,
++        )
++
++        transfer_id = req_meta.get("transfer_id")
++        request_id = req_meta.get("request_id")
++
+         if ret < 0:
+             logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
++            if self._io_collector is not None:
++                record_mooncake_io(
++                    self._io_collector,
++                    component="p2p",
++                    operation="read",
++                    outcome="error",
++                    error_kind="return_code",
++                    attempted_bytes=attempted_bytes,
++                    completed_bytes=None,
++                    operations=num_descriptors,
++                    descriptors=num_descriptors,
++                    duration_seconds=transfer_duration_s,
++                    network_type=net_type,
++                    network_type_source=net_source,
++                    transfer_id=transfer_id,
++                    prepare_duration_seconds=prepare_duration,
++                )
++            log_mooncake_io_event(
++                "d_transfer_end",
++                component="p2p",
++                operation="read",
++                outcome="error",
++                network_type=net_type,
++                network_type_source=net_source,
++                attempted_bytes=attempted_bytes,
++                completed_bytes=None,
++                operations=num_descriptors,
++                descriptors=num_descriptors,
++                duration_ns=transfer_duration_ns,
++                transfer_id=transfer_id,
++                request_id=request_id,
++                remote_request_id=remote_request_id,
++                engine_id=self.local_engine_id,
++                tp_rank=self.tp_rank,
++            )
+             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+ 
++        if self._io_collector is not None:
++            record_mooncake_io(
++                self._io_collector,
++                component="p2p",
++                operation="read",
++                outcome="success",
++                error_kind="none",
++                attempted_bytes=attempted_bytes,
++                completed_bytes=attempted_bytes,
++                operations=num_descriptors,
++                descriptors=num_descriptors,
++                duration_seconds=transfer_duration_s,
++                network_type=net_type,
++                network_type_source=net_source,
++                transfer_id=transfer_id,
++                prepare_duration_seconds=prepare_duration,
++            )
++        log_mooncake_io_event(
++            "d_transfer_end",
++            component="p2p",
++            operation="read",
++            outcome="success",
++            network_type=net_type,
++            network_type_source=net_source,
++            attempted_bytes=attempted_bytes,
++            completed_bytes=attempted_bytes,
++            operations=num_descriptors,
++            descriptors=num_descriptors,
++            duration_ns=transfer_duration_ns,
++            transfer_id=transfer_id,
++            request_id=request_id,
++            remote_request_id=remote_request_id,
++            engine_id=self.local_engine_id,
++            tp_rank=self.tp_rank,
++        )
++
+         req_end_time = time.perf_counter()
+         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
+         logger.info(
+             "KV cache transfer for request %s took %.2f ms (%d groups,"
+-            " %d blocks). local_ip %s local_device_id %s remote_session_id %s",
++            " %d blocks). local_ip %s local_device_id %s remote_session_id %s"
++            " network_type %s",
+             remote_request_id,
+             req_transfer_elapsed,
+             num_transfer_groups,
+@@ -707,6 +834,18 @@ class KVCacheRecvingThread(threading.Thread):
+             )
+             self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
+             self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
++            # Cache remote buffer regions for network-type inference.
++            remote_regions: list[KVBufferRegion] = []
++            base_addrs = agent_meta.kv_caches_base_addr
++            region_lens = getattr(agent_meta, "kv_caches_region_lengths", [])
++            mem_kinds = getattr(agent_meta, "kv_caches_memory_kinds", [])
++            for idx, base in enumerate(base_addrs):
++                rlen = region_lens[idx] if idx < len(region_lens) else 0
++                mkind = mem_kinds[idx] if idx < len(mem_kinds) else "unknown"
++                remote_regions.append(
++                    KVBufferRegion(base_address=base, length=rlen, memory_kind=mkind)
++                )
++            self._remote_buffer_regions[engine_id][remote_handshake_port] = remote_regions
+         finally:
+             if sock is not None:
+                 self._return_remote_socket(sock, remote_host, remote_handshake_port)
+@@ -805,6 +944,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
+             remote_ptp_size=kv_transfer_params.get("remote_ptp_size"),
+             remote_multi_nodes_meta_mapping=kv_transfer_params.get("remote_multi_nodes_meta_mapping", {}),
+             num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
++            transfer_id=kv_transfer_params.get("transfer_id"),
+         )
+ 
+ 
+@@ -904,6 +1044,24 @@ class MooncakeConnector(KVConnectorBase_V1):
+         assert self.connector_scheduler is not None
+         self.connector_scheduler.set_xfer_handshake_metadata(metadata)
+ 
++    ############################################################
++    # Stats Methods
++    ############################################################
++
++    def get_kv_connector_stats(self) -> KVConnectorStats | None:
++        """Drain Mooncake P2P IO stats from the worker."""
++        if self.connector_worker is None:
++            return None
++        return self.connector_worker._io_collector.drain()
++
++    @classmethod
++    def build_kv_connector_stats(
++        cls, data: dict[str, Any] | None = None
++    ) -> KVConnectorStats | None:
++        if data is None:
++            return MooncakeIOStats(data={})
++        return MooncakeIOStats(data=data)
++
+ 
+ class MooncakeConnectorScheduler:
+     """Implementation of Scheduler side methods"""
+@@ -1060,6 +1218,16 @@ class MooncakeConnectorScheduler:
+ 
+         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
+ 
++        # Propagate or generate a transfer_id for cross-P/D log
++        # correlation.  If the proxy already supplied one, reuse it;
++        # otherwise generate a UUID so D-side events can be matched
++        # back to this P-side request.
++        transfer_id = None
++        if params is not None:
++            transfer_id = params.get("transfer_id")
++        if transfer_id is None:
++            transfer_id = str(uuid.uuid4())
++
+         return delay_free_blocks, dict(
+             do_remote_prefill=True,
+             do_remote_decode=False,
+@@ -1074,6 +1242,7 @@ class MooncakeConnectorScheduler:
+             last_token_id=request.output_token_ids[-1],
+             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
+             num_prompt_blocks=num_prompt_blocks,
++            transfer_id=transfer_id,
+         )
+ 
+     def set_xfer_handshake_metadata(self, metadata: dict[int, KVConnectorHandshakeMetadata]) -> None:
+@@ -1159,6 +1328,11 @@ class MooncakeConnectorWorker:
+         self.local_remote_block_port_mapping: dict[str, list[list[int]] | None] = {}
+         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
+ 
++        # Mooncake IO stats collector for P2P transfers.
++        self._io_collector = MooncakeIOStatsCollector()
++        # Registered local KV buffer regions for network-type inference.
++        self._local_buffer_regions: list[KVBufferRegion] = []
++
+     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
+         # get prefill tp and dp size from extra config
+         prefill_parallel_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("prefill", {})
+@@ -1222,6 +1396,9 @@ class MooncakeConnectorWorker:
+         kv_caches_base_addr = []
+         ptrs = []
+         lengths = []
++        region_lengths = []
++        memory_kinds = []
++        local_buffer_regions: list[KVBufferRegion] = []
+         length = len(self.block_len)
+         for cache_or_caches in kv_caches.values():
+             # Normalize to always be a list of caches
+@@ -1231,7 +1408,19 @@ class MooncakeConnectorWorker:
+                 kv_caches_base_addr.append(base_addr)
+                 ptrs.append(base_addr)
+                 lengths.append(region_len)
++                region_lengths.append(region_len)
++                mem_kind = str(cache.device.type) if hasattr(cache, "device") else "unknown"
++                memory_kinds.append(mem_kind)
++                local_buffer_regions.append(
++                    KVBufferRegion(
++                        base_address=base_addr,
++                        length=region_len,
++                        memory_kind=mem_kind,
++                        device_index=getattr(cache.device, "index", None),
++                    )
++                )
+         global_te.register_buffer(ptrs, lengths)
++        self._local_buffer_regions = local_buffer_regions
+         # After KV Caches registered, start the sending or receiving thread.
+         metadata = MooncakeAgentMetadata(
+             engine_id=self.engine_id,
+@@ -1239,6 +1428,8 @@ class MooncakeConnectorWorker:
+             kv_caches_base_addr=kv_caches_base_addr,
+             num_blocks=self.num_blocks,
+             local_ip=get_ip(),
++            kv_caches_region_lengths=region_lengths,
++            kv_caches_memory_kinds=memory_kinds,
+         )
+         self.xfer_handshake_metadata = metadata
+ 
+@@ -1272,6 +1463,8 @@ class MooncakeConnectorWorker:
+                 self.vllm_config,
+                 self.kv_caches,
+                 self._prefill_pp_layer_partition,
++                io_collector=self._io_collector,
++                local_buffer_regions=self._local_buffer_regions,
+             )
+             self.kv_recv_thread.start()
+ 
+@@ -1562,6 +1755,7 @@ class MooncakeConnectorWorker:
+                             all_task_done=(
+                                 pcp_dcp_rank == len(remote_handshake_port_list) - 1 and i == tp_num_need_pulls - 1
+                             ),
++                            transfer_id=meta.transfer_id,
+                         )
+             else:  # TODO: support prefill context parallel and pipeline parallel open at the same time
+                 chosen_rank_list = self._get_remote_rank(remote_req_id, prefill_tp_size)
+@@ -1586,6 +1780,7 @@ class MooncakeConnectorWorker:
+                         offset=i,
+                         tp_num_need_pulls=tp_num_need_pulls,
+                         all_task_done=(i == tp_num_need_pulls * self._prefill_pp_size - 1),
++                        transfer_id=meta.transfer_id,
+                     )
+ 
+         for req_id in metadata.reqs_in_batch:
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+index 717ff70a3..997afb26c 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+@@ -214,6 +214,26 @@ class AscendStoreConnector(KVConnectorBase_V1):
+         ascend_store_kv_events.add_events(events)
+         return ascend_store_kv_events
+ 
++    ############################################################
++    # Stats Methods
++    ############################################################
++
++    def get_kv_connector_stats(self):
++        """Drain Mooncake Store IO stats from the worker."""
++        if self.connector_worker is None:
++            return None
++        return self.connector_worker.get_kv_connector_stats()
++
++    @classmethod
++    def build_kv_connector_stats(cls, data: dict[str, Any] | None = None):
++        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_metrics import (
++            MooncakeIOStats,
++        )
++
++        if data is None:
++            return MooncakeIOStats(data={})
++        return MooncakeIOStats(data=data)
++
+ 
+ class LookupKeyServer:
+     def __init__(
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/backend.py
+index c0115a008..7a9537d01 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/backend.py
+@@ -1,7 +1,17 @@
+ from abc import ABC, abstractmethod
++from typing import TYPE_CHECKING
+ 
+ from vllm.config import ParallelConfig
+ 
++if TYPE_CHECKING:
++    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
++        KVConnectorStats,
++    )
++    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_metrics import (
++        KVBufferRegion,
++        MooncakeIOStatsCollector,
++    )
++
+ 
+ class Backend(ABC):
+     @abstractmethod
+@@ -12,10 +22,26 @@ class Backend(ABC):
+     def set_device(self):
+         pass
+ 
+-    @abstractmethod
+     def register_buffer(self, ptrs: list[int], lengths: list[int]):
++        """Register local KV cache buffers.
++
++        Subclasses may override :meth:`register_buffer_regions` instead
++        to also receive memory-kind information for network-type
++        inference.
++        """
+         pass
+ 
++    def register_buffer_regions(self, regions: "list[KVBufferRegion]") -> None:
++        """Register local KV cache buffers with memory-kind metadata.
++
++        Default implementation delegates to :meth:`register_buffer` for
++        backward compatibility with backends that do not need memory
++        kind information.
++        """
++        ptrs = [r.base_address for r in regions]
++        lengths = [r.length for r in regions]
++        self.register_buffer(ptrs, lengths)
++
+     @abstractmethod
+     def exists(self, keys: list[str]) -> list[int]:
+         pass
+@@ -27,3 +53,12 @@ class Backend(ABC):
+     @abstractmethod
+     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+         pass
++
++    def get_kv_connector_stats(self) -> "KVConnectorStats | None":
++        """Drain IO stats from this backend.
++
++        Backends that support Mooncake IO telemetry should override
++        this method to drain their collector.  The default
++        implementation returns ``None`` (no stats).
++        """
++        return None
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
+index 078590f6c..d6bace68e 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
+@@ -1,19 +1,33 @@
+ # Standard
+ import json
+ import os
++import time
+ from dataclasses import dataclass
++from typing import TYPE_CHECKING
+ 
+ import regex as re
+ import torch
+ 
+ # Third Party
+ from vllm.config import ParallelConfig
++from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_metrics import (
++    KVBufferRegion,
++    MooncakeIOStatsCollector,
++    classify_network_type,
++    log_mooncake_io_event,
++    record_mooncake_io,
++)
+ from vllm.logger import logger
+ from vllm.utils.network_utils import get_ip
+ 
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+ from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+ 
++if TYPE_CHECKING:
++    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
++        KVConnectorStats,
++    )
++
+ DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
+ DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
+ 
+@@ -31,6 +45,11 @@ class MooncakeBackend(Backend):
+         self.config = MooncakeStoreConfig.load_from_env()
+         self.store = MooncakeDistributedStore()
+         self.rank = parallel_config.rank
++
++        # Mooncake IO stats collector for Store operations.
++        self._io_collector = MooncakeIOStatsCollector()
++        # Registered local buffer regions for network-type inference.
++        self._local_buffer_regions: list[KVBufferRegion] = []
+         if self.config.protocol == "ascend":
+             local_hostname = get_ip()
+             # ASCEND_ENABLE_USE_FABRIC_MEM: Enable unified memory address direct transmission scheme
+@@ -74,26 +93,179 @@ class MooncakeBackend(Backend):
+         if os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") != "1":
+             global_te.register_buffer(ptrs, lengths)
+ 
++    def register_buffer_regions(self, regions: list[KVBufferRegion]) -> None:
++        self._local_buffer_regions = regions
++        if os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") != "1":
++            ptrs = [r.base_address for r in regions]
++            lengths = [r.length for r in regions]
++            global_te.register_buffer(ptrs, lengths)
++
+     def exists(self, keys: list[str]) -> list[int]:
+         return self.store.batch_is_exist(keys)
+ 
+     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
++        attempted_bytes = sum(sum(s) for s in sizes)
++        num_keys = len(keys)
++        num_descriptors = sum(len(s) for s in sizes)
++
++        # Path-infer network_type from registered buffer regions.
++        net_type, net_source = classify_network_type(
++            component="store",
++            local_regions=self._local_buffer_regions,
++        )
++
++        start_ns = time.perf_counter_ns()
++        error_kind = "none"
++        outcome = "success"
++        completed_bytes = 0
+         try:
+             res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes)
++            success_count = 0
++            fail_count = 0
++            for value in res:
++                if value == 0:
++                    success_count += 1
++                else:
++                    fail_count += 1
++            # Guard against empty result vector (e.g. dummy client).
++            if success_count == 0 and fail_count == 0:
++                outcome = "error"
++                error_kind = "invalid_result"
++            elif fail_count == 0:
++                outcome = "success"
++                completed_bytes = attempted_bytes
++            elif success_count == 0:
++                outcome = "error"
++                error_kind = "return_code"
++            else:
++                outcome = "partial"
++                error_kind = "return_code"
++                # Exact completed bytes: sum sizes of successful keys.
++                completed_bytes = sum(
++                    sum(sizes[i]) for i, v in enumerate(res) if v == 0
++                )
+             for value in res:
+                 if value < 0:
+                     logger.error(f"Failed to put key {keys},res:{res}")
+         except Exception as e:
++            outcome = "error"
++            error_kind = "exception"
+             logger.error(f"Failed to put key {keys},error:{e}")
++        finally:
++            duration_ns = time.perf_counter_ns() - start_ns
++            duration_s = duration_ns / 1e9
++
++            record_mooncake_io(
++                self._io_collector,
++                component="store",
++                operation="put",
++                outcome=outcome,
++                error_kind=error_kind,
++                attempted_bytes=attempted_bytes,
++                completed_bytes=completed_bytes if outcome != "error" else None,
++                operations=num_keys,
++                descriptors=num_descriptors,
++                duration_seconds=duration_s,
++                network_type=net_type,
++                network_type_source=net_source,
++            )
++            log_mooncake_io_event(
++                "store_put_end",
++                component="store",
++                operation="put",
++                outcome=outcome,
++                network_type=net_type,
++                network_type_source=net_source,
++                attempted_bytes=attempted_bytes,
++                completed_bytes=completed_bytes if outcome != "error" else None,
++                operations=num_keys,
++                descriptors=num_descriptors,
++                duration_ns=duration_ns,
++                extra={"num_keys": num_keys},
++            )
+ 
+     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
++        attempted_bytes = sum(sum(s) for s in sizes)
++        num_keys = len(keys)
++        num_descriptors = sum(len(s) for s in sizes)
++
++        # Path-infer network_type from registered buffer regions.
++        net_type, net_source = classify_network_type(
++            component="store",
++            local_regions=self._local_buffer_regions,
++        )
++
++        start_ns = time.perf_counter_ns()
++        error_kind = "none"
++        outcome = "success"
++        completed_bytes = 0
+         try:
+             res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
++            success_count = 0
++            fail_count = 0
++            for value in res:
++                if value >= 0:
++                    success_count += 1
++                    completed_bytes += value
++                else:
++                    fail_count += 1
++            # Guard against empty result vector (e.g. dummy client).
++            if success_count == 0 and fail_count == 0:
++                outcome = "error"
++                error_kind = "invalid_result"
++                completed_bytes = 0
++            elif fail_count == 0:
++                outcome = "success"
++            elif success_count == 0:
++                outcome = "error"
++                error_kind = "return_code"
++                completed_bytes = 0
++            else:
++                outcome = "partial"
++                error_kind = "return_code"
+             for value in res:
+                 if value < 0:
+                     logger.error(f"Failed to get key {keys}, res:{res}")
+         except Exception as e:
++            outcome = "error"
++            error_kind = "exception"
+             logger.error(f"Failed to get key {keys}, error:{e}")
++        finally:
++            duration_ns = time.perf_counter_ns() - start_ns
++            duration_s = duration_ns / 1e9
++
++            record_mooncake_io(
++                self._io_collector,
++                component="store",
++                operation="get",
++                outcome=outcome,
++                error_kind=error_kind,
++                attempted_bytes=attempted_bytes,
++                completed_bytes=completed_bytes if outcome != "error" else None,
++                operations=num_keys,
++                descriptors=num_descriptors,
++                duration_seconds=duration_s,
++                network_type=net_type,
++                network_type_source=net_source,
++            )
++            log_mooncake_io_event(
++                "store_get_end",
++                component="store",
++                operation="get",
++                outcome=outcome,
++                network_type=net_type,
++                network_type_source=net_source,
++                attempted_bytes=attempted_bytes,
++                completed_bytes=completed_bytes if outcome != "error" else None,
++                operations=num_keys,
++                descriptors=num_descriptors,
++                duration_ns=duration_ns,
++                extra={"num_keys": num_keys},
++            )
++
++    def get_kv_connector_stats(self) -> "KVConnectorStats | None":
++        """Drain Store IO stats."""
++        return self._io_collector.drain()
+ 
+ 
+ @dataclass
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index a9dd0c2b6..42a9ed57b 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -184,6 +184,12 @@ class KVPoolWorker:
+         ptrs = []
+         lengths = []
+         length = len(self.block_len)
++        # Build KVBufferRegion list for network-type inference.
++        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_metrics import (
++            KVBufferRegion,
++        )
++
++        regions: list[KVBufferRegion] = []
+         for cache_or_caches in kv_caches.values():
+             # Normalize to always be a list of caches
+             for i, cache in enumerate(cache_or_caches, 0):
+@@ -192,8 +198,17 @@ class KVPoolWorker:
+                 self.kv_caches_base_addr.append(base_addr)
+                 ptrs.append(base_addr)
+                 lengths.append(region_len)
++                mem_kind = str(cache.device.type) if hasattr(cache, "device") else "unknown"
++                regions.append(
++                    KVBufferRegion(
++                        base_address=base_addr,
++                        length=region_len,
++                        memory_kind=mem_kind,
++                        device_index=getattr(cache.device, "index", None),
++                    )
++                )
+ 
+-        self.m_store.register_buffer(ptrs, lengths)
++        self.m_store.register_buffer_regions(regions)
+         self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
+         self.token_database.set_block_len(self.block_len)
+ 
+@@ -498,6 +513,10 @@ class KVPoolWorker:
+         )
+         return done_sending, done_recving
+ 
++    def get_kv_connector_stats(self):
++        """Delegate IO stats drain to the backend."""
++        return self.m_store.get_kv_connector_stats()
++
+     def get_and_clear_finished_requests(self, finished_req_ids, meta: AscendConnectorMetadata) -> set[str]:
+         finished_sending = set()
+         for req_id in meta.preempted_req_ids:
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 5ec03c55d..00afc3381 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -415,8 +415,11 @@ class NPUWorker(WorkerBase):
+             return None
+ 
+         # In case of PP with kv transfer, we need to pass through the
+-        # kv_connector_output
+-        if not kv_connector_output.finished_sending and not kv_connector_output.finished_recving:
++        # kv_connector_output.  Use is_empty() (which checks stats,
++        # events, and worker_meta too) instead of only checking
++        # finished_sending/finished_recving, so that PP intermediate
++        # ranks with only kv_connector_stats are not dropped.
++        if kv_connector_output.is_empty():
+             return EMPTY_MODEL_RUNNER_OUTPUT
+         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+         output.kv_connector_output = kv_connector_output
