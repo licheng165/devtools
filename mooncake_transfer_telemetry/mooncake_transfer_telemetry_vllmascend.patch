@@ -1,5 +1,5 @@
 diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
-index 95d05fdc8..d3ca94b77 100644
+index 95d05fdc8..94f580fc9 100644
 --- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
 +++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
 @@ -9,6 +9,7 @@ import random
@@ -93,7 +93,7 @@ index 95d05fdc8..d3ca94b77 100644
              }
          )
  
-@@ -543,16 +571,115 @@ class KVCacheRecvingThread(threading.Thread):
+@@ -543,16 +571,118 @@ class KVCacheRecvingThread(threading.Thread):
                  dst_list.append(dst)
                  length_list.append(length)
  
@@ -106,6 +106,12 @@ index 95d05fdc8..d3ca94b77 100644
 +        transfer_end = time.perf_counter_ns()
 +        transfer_duration_ns = transfer_end - transfer_start
 +        transfer_duration_s = transfer_duration_ns / 1e9
++
++        # Compute the original elapsed metric immediately after the API
++        # returns, BEFORE stats recording and JSON logging add overhead.
++        # This preserves the original timing semantics of the info log
++        # below (descriptor construction + API call, nothing else).
++        req_transfer_elapsed = (prepare_duration + transfer_duration_s) * 1000
 +
 +        attempted_bytes = sum(length_list)
 +        num_descriptors = len(length_list)
@@ -126,7 +132,7 @@ index 95d05fdc8..d3ca94b77 100644
 +        request_id = req_meta.get("request_id")
 +
          if ret < 0:
-             logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
+-            logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
 +            if self._io_collector is not None:
 +                record_mooncake_io(
 +                    self._io_collector,
@@ -164,6 +170,8 @@ index 95d05fdc8..d3ca94b77 100644
 +            )
              raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
  
+-        req_end_time = time.perf_counter()
+-        req_transfer_elapsed = (req_end_time - req_start_time) * 1000
 +        if self._io_collector is not None:
 +            record_mooncake_io(
 +                self._io_collector,
@@ -200,8 +208,6 @@ index 95d05fdc8..d3ca94b77 100644
 +            tp_rank=self.tp_rank,
 +        )
 +
-         req_end_time = time.perf_counter()
-         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
          logger.info(
              "KV cache transfer for request %s took %.2f ms (%d groups,"
 -            " %d blocks). local_ip %s local_device_id %s remote_session_id %s",
@@ -210,7 +216,15 @@ index 95d05fdc8..d3ca94b77 100644
              remote_request_id,
              req_transfer_elapsed,
              num_transfer_groups,
-@@ -707,6 +834,18 @@ class KVCacheRecvingThread(threading.Thread):
+@@ -560,6 +690,7 @@ class KVCacheRecvingThread(threading.Thread):
+             get_ip(),
+             self.tp_rank,
+             session_id,
++            net_type,
+         )
+ 
+         # Determine if the current position is the offset position at the end of
+@@ -707,6 +838,18 @@ class KVCacheRecvingThread(threading.Thread):
              )
              self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
              self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
@@ -229,7 +243,7 @@ index 95d05fdc8..d3ca94b77 100644
          finally:
              if sock is not None:
                  self._return_remote_socket(sock, remote_host, remote_handshake_port)
-@@ -805,6 +944,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
+@@ -805,6 +948,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
              remote_ptp_size=kv_transfer_params.get("remote_ptp_size"),
              remote_multi_nodes_meta_mapping=kv_transfer_params.get("remote_multi_nodes_meta_mapping", {}),
              num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
@@ -237,7 +251,7 @@ index 95d05fdc8..d3ca94b77 100644
          )
  
  
-@@ -904,6 +1044,24 @@ class MooncakeConnector(KVConnectorBase_V1):
+@@ -904,6 +1048,24 @@ class MooncakeConnector(KVConnectorBase_V1):
          assert self.connector_scheduler is not None
          self.connector_scheduler.set_xfer_handshake_metadata(metadata)
  
@@ -262,7 +276,7 @@ index 95d05fdc8..d3ca94b77 100644
  
  class MooncakeConnectorScheduler:
      """Implementation of Scheduler side methods"""
-@@ -1060,6 +1218,16 @@ class MooncakeConnectorScheduler:
+@@ -1060,6 +1222,16 @@ class MooncakeConnectorScheduler:
  
          num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
  
@@ -279,7 +293,7 @@ index 95d05fdc8..d3ca94b77 100644
          return delay_free_blocks, dict(
              do_remote_prefill=True,
              do_remote_decode=False,
-@@ -1074,6 +1242,7 @@ class MooncakeConnectorScheduler:
+@@ -1074,6 +1246,7 @@ class MooncakeConnectorScheduler:
              last_token_id=request.output_token_ids[-1],
              remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
              num_prompt_blocks=num_prompt_blocks,
@@ -287,7 +301,7 @@ index 95d05fdc8..d3ca94b77 100644
          )
  
      def set_xfer_handshake_metadata(self, metadata: dict[int, KVConnectorHandshakeMetadata]) -> None:
-@@ -1159,6 +1328,11 @@ class MooncakeConnectorWorker:
+@@ -1159,6 +1332,11 @@ class MooncakeConnectorWorker:
          self.local_remote_block_port_mapping: dict[str, list[list[int]] | None] = {}
          self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
  
@@ -299,7 +313,7 @@ index 95d05fdc8..d3ca94b77 100644
      def _get_prefill_decode_size(self, vllm_config: VllmConfig):
          # get prefill tp and dp size from extra config
          prefill_parallel_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("prefill", {})
-@@ -1222,6 +1396,9 @@ class MooncakeConnectorWorker:
+@@ -1222,6 +1400,9 @@ class MooncakeConnectorWorker:
          kv_caches_base_addr = []
          ptrs = []
          lengths = []
@@ -309,7 +323,7 @@ index 95d05fdc8..d3ca94b77 100644
          length = len(self.block_len)
          for cache_or_caches in kv_caches.values():
              # Normalize to always be a list of caches
-@@ -1231,7 +1408,19 @@ class MooncakeConnectorWorker:
+@@ -1231,7 +1412,19 @@ class MooncakeConnectorWorker:
                  kv_caches_base_addr.append(base_addr)
                  ptrs.append(base_addr)
                  lengths.append(region_len)
@@ -329,7 +343,7 @@ index 95d05fdc8..d3ca94b77 100644
          # After KV Caches registered, start the sending or receiving thread.
          metadata = MooncakeAgentMetadata(
              engine_id=self.engine_id,
-@@ -1239,6 +1428,8 @@ class MooncakeConnectorWorker:
+@@ -1239,6 +1432,8 @@ class MooncakeConnectorWorker:
              kv_caches_base_addr=kv_caches_base_addr,
              num_blocks=self.num_blocks,
              local_ip=get_ip(),
@@ -338,7 +352,7 @@ index 95d05fdc8..d3ca94b77 100644
          )
          self.xfer_handshake_metadata = metadata
  
-@@ -1272,6 +1463,8 @@ class MooncakeConnectorWorker:
+@@ -1272,6 +1467,8 @@ class MooncakeConnectorWorker:
                  self.vllm_config,
                  self.kv_caches,
                  self._prefill_pp_layer_partition,
@@ -347,7 +361,7 @@ index 95d05fdc8..d3ca94b77 100644
              )
              self.kv_recv_thread.start()
  
-@@ -1562,6 +1755,7 @@ class MooncakeConnectorWorker:
+@@ -1562,6 +1759,7 @@ class MooncakeConnectorWorker:
                              all_task_done=(
                                  pcp_dcp_rank == len(remote_handshake_port_list) - 1 and i == tp_num_need_pulls - 1
                              ),
@@ -355,7 +369,7 @@ index 95d05fdc8..d3ca94b77 100644
                          )
              else:  # TODO: support prefill context parallel and pipeline parallel open at the same time
                  chosen_rank_list = self._get_remote_rank(remote_req_id, prefill_tp_size)
-@@ -1586,6 +1780,7 @@ class MooncakeConnectorWorker:
+@@ -1586,6 +1784,7 @@ class MooncakeConnectorWorker:
                          offset=i,
                          tp_num_need_pulls=tp_num_need_pulls,
                          all_task_done=(i == tp_num_need_pulls * self._prefill_pp_size - 1),
